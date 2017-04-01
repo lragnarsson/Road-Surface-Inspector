@@ -5,31 +5,56 @@
  */
 
 class RoadSurfaceInspector {
-    constructor(canvas, leftTrack, rightTrack, params) {
+    constructor(canvas, leftTrack, rightTrack, renderCallback, params) {
         this.canvas = canvas;
         this.leftTrack = leftTrack;
         this.rightTrack = rightTrack;
-        this.sampleDistance = params.sampleDistance == null ? 0.1 : params.sampleDistance;
+        this.renderCallback = renderCallback;
+        this.sampleDistance = params.sampleDistance == null ? 0.5 : params.sampleDistance;
         this.trackWidth = params.trackWidth == null ? 1.55 : params.trackWidth;
         this.laneWidth = params.laneWidth == null ? 3.5 : params.laneWidth;
-        this.segmentLength = params.segmentLength == null ? 15 : params.segmentLength;
-        this.meshResolutionScale = params.meshResolutionScale == null ? 1 : params.meshResolutionScale;
+        this.widthSubdivisions = params.widthSubdivisions == null ? 1 : params.widthSubdivisions;
+        this.lengthSubdivisions = params.lengthSubdivisions == null ? 1 : params.lengthSubdivisions;
         this.roadBankingAngle = params.roadBankingAngle == null ? 0 : params.roadBankingAngle;
         this.roadGradeAngle = params.roadGradeAngle == null ? 0 : params.roadGradeAngle;
-        this.roadRoughness = params.roadRoughness == null ? 0 : params.roadRoughness;
-        this.backgroundColorTop = params.backgroundColorTop == null ? {r: 0.1, g: 0.1, b: 0.4, a: 1} : params.backgroundColorTop;
-        this.backgroundColorBottom = params.backgroundColorBottom == null ? {r: 0.01, g: 0.01, b: 0.1, a: 1} : params.backgroundColorBottom;
+        this.roadRoughness = params.roadRoughness == null ? 0.015 : params.roadRoughness;
+        this.backgroundColorTop = params.backgroundColorTop == null ? {r: 0.3, g: 0.5, b: 0.9, a: 1} : params.backgroundColorTop;
+        this.backgroundColorBottom = params.backgroundColorBottom == null ? {r: 0.44, g: 0.64, b: 0.95, a: 1} : params.backgroundColorBottom;
         this.forceGL1 = params.forceGL1 == null ? false : params.forceGL1;
+        this.orbitSensitivity = params.orbitSensitivity == null ? 1 : params.orbitSensitivity;
+
+        this.error = null;
+
+        if (this.leftTrack.length != this.rightTrack.length) {
+            this.error = "Left and right track must be the same length!";
+            return;
+        }
+        if (this.laneWidth <= this.trackWidth) {
+            this.error = "Lane width must be larger than track width!";
+            return;
+        }
+        this.roadLength = this.sampleDistance * this.leftTrack.length;
+        this.DsX = this.sampleDistance / (this.lengthSubdivisions + 1);
+        this.DsY = this.trackWidth / (this.widthSubdivisions + 1);
 
         this.drag = false;
         this.mouseDX = 0;
         this.mouseDY = 0;
-        this.theta = 0;
-        this.phi = 0;
+        this.theta = Math.PI / 2;
+        this.phi = Math.PI / 4;
         this.mouseOldX = 0;
         this.mouseOldY = 0;
 
-        this.error = null;
+        this.camOrbitRadius = 5;
+        this.camPos = [-2, 1, -2];
+        this.camUp = [0, 1, 0];
+        this.camPOI = [0, 0, 0];
+        this.camQuaternion = []
+
+        this.surfaceGrid = null;
+        this.surfaceVertices = null;
+        this.surfaceIndices = null;
+        this.surfaceNormals = null;
 
         if (!this._initGLContext()) {
             return;
@@ -37,25 +62,31 @@ class RoadSurfaceInspector {
 
         // Define attribute locations:
         this.VX_BUF = 0;
+        this.NM_BUF = 1;
 
         if (!this._initShaders()) {
             return;
         }
 
-        this.GL.clearColor(0.3, 0.3, 0.3, 1);
+        this._generateSurfaceGrid();
+        this._generateSurfaceTriangles();
 
-        this._generateSurfaceMesh();
+        this._initBackground();
 
         this._initUniforms();
 
+        this.boundDraw = e => this.draw();
         this.boundMouseDown = e => this._mouseDown(e);
         this.boundMouseUp = e => this._mouseUp(e);
         this.boundMouseMove = e => this._mouseMove(e);
+        this.boundMouseWheel = e => this._mouseWheel(e);
 
         this.canvas.addEventListener("mousedown", this.boundMouseDown, false);
         this.canvas.addEventListener("mouseup", this.boundMouseUp, false);
         this.canvas.addEventListener("mouseout", this.boundMouseUp, false);
-        this.canvas.addEventListener("mousemove", this.boundMoseMove, false);
+        this.canvas.addEventListener("mousemove", this.boundMouseMove, false);
+        this.canvas.addEventListener("mousewheel", this.boundMouseWheel, false);
+        this.canvas.addEventListener("DOMMouseScroll", this.boundMouseWheel, false); // Firefox Hipsters
 
         this.draw();
     }
@@ -99,6 +130,9 @@ class RoadSurfaceInspector {
             this.error = "Could not initialize a WebGL context.";
             return false;
         }
+
+        this.GL.clearColor(0.6, 0.6, 0.65, 1);
+        this.GL.viewport(0, 0, this.canvas.width, this.canvas.height);
         return true;
     }
 
@@ -112,12 +146,90 @@ class RoadSurfaceInspector {
 
 
     _initUniforms() {
-        let projection = this._createProjectionMatrix(45, this.canvas.width/this.canvas.height, 0.001, 10000);
+        const aspectRatio = this.canvas.width/this.canvas.height;
+        const fovY = 45;
+        const near = 1;
+        const far = 1000;
+        const projection = this._projection(fovY, aspectRatio, near, far);
 
-        this.GL.viewport(0, 0, this.canvas.width, this.canvas.height);
+        // Surface shader uniforms:
         this.GL.useProgram(this.surfaceProgram);
         let projLoc = this.GL.getUniformLocation(this.surfaceProgram, 'projection');
         this.GL.uniformMatrix4fv(projLoc, false, projection);
+
+        let model = this._translate([-this.roadLength/2, 0, -this.laneWidth/2]);
+        let modelLoc = this.GL.getUniformLocation(this.surfaceProgram, 'model');
+        this.GL.uniformMatrix4fv(modelLoc, false, model);
+
+        this._updateCam();
+
+        // Background shader uniforms:
+        this.GL.useProgram(this.backgroundProgram);
+
+        let bgProjLoc = this.GL.getUniformLocation(this.backgroundProgram, 'projection');
+        this.GL.uniformMatrix4fv(bgProjLoc, false, projection);
+
+        let bModel = this._translate(this.camPos);
+        let bModelLoc = this.GL.getUniformLocation(this.backgroundProgram, 'model');
+        this.GL.uniformMatrix4fv(bModelLoc, false, bModel);
+
+        let topLoc = this.GL.getUniformLocation(this.backgroundProgram, 'colorTop');
+        this.GL.uniform4fv(topLoc, new Float32Array([
+        this.backgroundColorTop.r, this.backgroundColorTop.g, this.backgroundColorTop.b, 1]));
+
+        let bottomLoc = this.GL.getUniformLocation(this.backgroundProgram, 'colorBottom');
+        this.GL.uniform4fv(bottomLoc, new Float32Array([
+        this.backgroundColorBottom.r, this.backgroundColorBottom.g, this.backgroundColorBottom.b, 1]));
+    }
+
+
+    _initBackground() {
+    let backgroundVertices = new Float32Array([
+        // Front
+        -1.0, -1.0,  1.0,
+        1.0, -1.0,  1.0,
+        1.0,  1.0,  1.0,
+        -1.0,  1.0,  1.0,
+        // Back
+        -1.0, -1.0, -1.0,
+        -1.0,  1.0, -1.0,
+        1.0,  1.0, -1.0,
+        1.0, -1.0, -1.0,
+        // Top
+        -1.0,  1.0, -1.0,
+        -1.0,  1.0,  1.0,
+        1.0,  1.0,  1.0,
+        1.0,  1.0, -1.0,
+        // Bottom
+        -1.0, -1.0, -1.0,
+        1.0, -1.0, -1.0,
+        1.0, -1.0,  1.0,
+        -1.0, -1.0,  1.0,
+        // Right
+        1.0, -1.0, -1.0,
+        1.0,  1.0, -1.0,
+        1.0,  1.0,  1.0,
+        1.0, -1.0,  1.0,
+        // Left
+        -1.0, -1.0, -1.0,
+        -1.0, -1.0,  1.0,
+        -1.0,  1.0,  1.0,
+        -1.0,  1.0, -1.0,
+    ]);
+
+    let backgroundIndices = new Uint16Array([
+        0, 1, 2,      0, 2, 3,    // Front
+        4, 5, 6,      4, 6, 7,    // Back
+        8, 9, 10,     8, 10, 11,  // Top
+        12, 13, 14,   12, 14, 15, // Bottom
+        16, 17, 18,   16, 18, 19, // Right
+        20, 21, 22,   20, 22, 23  // Left
+    ]);
+
+        this.GL.useProgram(this.backgroundProgram);
+        this.backgroundIndexBuffer = this._initArrayBuffer(backgroundIndices, this.GL.ELEMENT_ARRAY_BUFFER);
+        this.backgroundVertexBuffer = this._initArrayBuffer(backgroundVertices, this.GL.ARRAY_BUFFER);
+        this.backgroundIndexSize = backgroundIndices.length;
     }
 
 
@@ -128,22 +240,137 @@ class RoadSurfaceInspector {
     }
 
 
-    _generateSurfaceMesh() {
-        let surfaceIndices = new Uint16Array([
-            0,1,2, 0,2,3, 4,5,6, 4,6,7,
-            8,9,10, 8,10,11, 12,13,14, 12,14,15,
-            16,17,18, 16,18,19, 20,21,22, 20,22,23
-         ]);
-        let surfaceVertices = new Float32Array([
-            -1,-1,-1, 1,-1,-1, 1, 1,-1, -1, 1,-1,
-            -1,-1, 1, 1,-1, 1, 1, 1, 1, -1, 1, 1,
-            -1,-1,-1, -1, 1,-1, -1, 1, 1, -1,-1, 1,
-            1,-1,-1, 1, 1,-1, 1, 1, 1, 1,-1, 1,
-            -1,-1,-1, -1,-1, 1, 1,-1, 1, 1,-1,-1,
-            -1, 1,-1, -1, 1, 1, 1, 1, 1, 1, 1,-1]);
-        this.surfaceIndexBuffer = this._initArrayBuffer(surfaceIndices, this.GL.ELEMENT_ARRAY_BUFFER);
-        this.surfaceVertexBuffer = this._initArrayBuffer(surfaceVertices, this.GL.ARRAY_BUFFER);
-        this.surfaceIndexSize = surfaceIndices.length;
+    _generateSurfaceGrid() {
+        const L = this.roadLength;
+        const TW = this.trackWidth;
+        const LW = this.laneWidth;
+        const OW = (LW - TW) / 2; 
+        const LSD = this.lengthSubdivisions;
+        const inN = this.leftTrack.length
+        const N = inN * (LSD + 1) - 1;
+        const outerNum = Math.max(1, Math.round(OW / this.DsY));
+        const innerNum = 2 + this.widthSubdivisions;
+        const M = 2 * outerNum + innerNum;
+
+        // Initialize height grid:
+        this.surfaceGrid = new Array(N+1);
+        for (let i=0; i<N+1; i++) {
+            this.surfaceGrid[i] = new Array(M);
+        }
+
+        // Set road height grid outside track:
+        for (let i=0; i<N+1; i++) {
+            for(let j=0; j < outerNum; j++) {
+                this.surfaceGrid[i][j] = 0;
+                this.surfaceGrid[i][M-1-j] = 0;
+            }
+        }
+
+        let inGrid = [this.leftTrack, this.rightTrack];
+        // Boundary condition:
+        inGrid[0].push(0); 
+        inGrid[1].push(0);
+
+        // Set road height grid inside track:
+        for (let i=0; i<inN; i++) {
+            for(let j=0; j < innerNum; j++) {
+                if (j == 0 || j == innerNum-1) { // On a track
+                    let inIndex = j == 0 ? j : 1;
+                    this.surfaceGrid[i * (1+LSD)][outerNum + j] = inGrid[inIndex][i];
+
+                    for (let k=1; k<LSD+1; k++) { // Interpolate lengthwise
+                        this.surfaceGrid[i * (1+LSD) + k][outerNum + j] = 0.5 * (inGrid[inIndex][i] + inGrid[inIndex][i+1]);
+                    }
+                } else { // In-between tracks - interpolate!
+                    let interp = (inGrid[0][i] + inGrid[1][i]) / 2;
+                    this.surfaceGrid[i * (1+LSD)][outerNum + j] = interp; //Math.sign(interp) * Math.pow(interp, 2);
+
+                    for (let k=1; k<LSD+1; k++) { // Interpolate lengthwise
+                        let interp1 = (inGrid[0][i] + inGrid[1][i]) / 2;
+                        let interp2 = (inGrid[0][i+1] + inGrid[1][i+1]) / 2;
+                        this.surfaceGrid[i*(1+LSD) + k][outerNum + j] = 0.5 * (interp1 + interp2);
+                    }
+                }
+            }
+        }
+    }
+
+
+    _generateSurfaceTriangles() {
+        const N = this.surfaceGrid.length; 
+        const M = this.surfaceGrid[0].length;
+        const numTriangles = (N-1) * (M-1) * 2;
+
+        this.surfaceVertices = new Float32Array(N * M * 3);
+        this.surfaceIndices = new Uint16Array(numTriangles * 3);
+        this.surfaceNormals = new Float32Array(N * M * 3);
+
+        for (let x=0; x<N; x++) {
+            for(let z=0; z<M; z++) {
+                this.surfaceVertices[(x + z * N)*3 + 0] = x * this.DsX;
+                this.surfaceVertices[(x + z * N)*3 + 1] = this.surfaceGrid[x][z] + this.roadRoughness * (Math.random() * 2 - 1);
+                this.surfaceVertices[(x + z * N)*3 + 2] = z * this.DsY;
+            }
+        }
+
+        for (let x=0; x<N-1; x++) {
+            for(let z=0; z<M-1; z++) {
+                let ax = (x + z * N)*3;
+                let a = [this.surfaceVertices[ax+0], this.surfaceVertices[ax+1], this.surfaceVertices[ax+2]];
+                let bx = (x + (z+1) * N)*3;
+                let b = [this.surfaceVertices[bx+0], this.surfaceVertices[bx+1], this.surfaceVertices[bx+2]];
+                let cx = (x+1 + z * N)*3;
+                let c = [this.surfaceVertices[cx+0], this.surfaceVertices[cx+1], this.surfaceVertices[cx+2]];
+                let dx = (x+1 + (z+1) * N)*3;
+                let d = [this.surfaceVertices[dx+0], this.surfaceVertices[dx+1], this.surfaceVertices[dx+2]];
+
+                let normal1 = this._cross(
+                    this._vecSub(b, a),
+                    this._vecSub(c, a));
+
+                let normal2 = this._cross(
+                    this._vecSub(b, c),
+                    this._vecSub(d, c));
+
+                //console.log(normal1);
+                this.surfaceNormals[ax+0] = normal1[0];
+                this.surfaceNormals[ax+1] = normal1[1];
+                this.surfaceNormals[ax+2] = normal1[2];
+
+                this.surfaceNormals[bx+0] = 0.5*(normal1[0]+normal2[0]);
+                this.surfaceNormals[bx+1] = 0.5*(normal1[1]+normal2[1]);
+                this.surfaceNormals[bx+2] = 0.5*(normal1[2]+normal2[2]);
+
+                this.surfaceNormals[cx+0] = 0.5*(normal1[0]+normal2[0]);
+                this.surfaceNormals[cx+1] = 0.5*(normal1[1]+normal2[1]);
+                this.surfaceNormals[cx+2] = 0.5*(normal1[2]+normal2[2]);
+
+                this.surfaceNormals[dx+0] = normal2[0];
+                this.surfaceNormals[dx+1] = normal2[1];
+                this.surfaceNormals[dx+2] = normal2[2];
+            }
+        }
+
+        for (let x=0; x<N - 1; x++) {
+            for(let z=0; z<M - 1; z++) {
+                // First triangle:
+                this.surfaceIndices[(x + z * (N-1))*6 + 0] = x + z * N;
+                this.surfaceIndices[(x + z * (N-1))*6 + 1] = x + (z+1) * N;
+                this.surfaceIndices[(x + z * (N-1))*6 + 2] = (x+1) + z * N;
+                // Second Triangle:
+                this.surfaceIndices[(x + z * (N-1))*6 + 3] = (x+1) + z * N;
+                this.surfaceIndices[(x + z * (N-1))*6 + 4] = x + (z+1) * N;
+                this.surfaceIndices[(x + z * (N-1))*6 + 5] = (x+1) + (z+1) * N;
+            }
+        }
+
+        this.GL.useProgram(this.surfaceProgram);
+        this.surfaceIndexBuffer = this._initArrayBuffer(this.surfaceIndices, this.GL.ELEMENT_ARRAY_BUFFER);
+        this.surfaceVertexBuffer = this._initArrayBuffer(this.surfaceVertices, this.GL.ARRAY_BUFFER);
+        this.surfaceNormalBuffer = this._initArrayBuffer(this.surfaceNormals, this.GL.ARRAY_BUFFER);
+
+        this.surfaceIndexSize = this.surfaceIndices.length;
+
     }
 
 
@@ -158,15 +385,24 @@ class RoadSurfaceInspector {
             this._drawBackgroundGL1();
             this._drawSurfaceGL1();
         }
+        let keepGoing = this.renderCallback();
+        if (keepGoing) {
+            requestAnimationFrame(this.boundDraw);
+        }
     }
 
 
     _drawSurfaceGL2() {
         this.GL.useProgram(this.surfaceProgram);
+        this.GL.enable(this.GL.DEPTH_TEST);
 
         this.GL.enableVertexAttribArray(this.VX_BUF);
         this.GL.bindBuffer(this.GL.ARRAY_BUFFER, this.surfaceVertexBuffer);
         this.GL.vertexAttribPointer(this.VX_BUF, 3, this.GL.FLOAT, false, 0, 0);
+
+        this.GL.enableVertexAttribArray(this.NM_BUF);
+        this.GL.bindBuffer(this.GL.ARRAY_BUFFER, this.surfaceNormalBuffer);
+        this.GL.vertexAttribPointer(this.NM_BUF, 3, this.GL.FLOAT, false, 0, 0);
 
         this.GL.bindBuffer(this.GL.ELEMENT_ARRAY_BUFFER, this.surfaceIndexBuffer);
         this.GL.drawElements(this.GL.TRIANGLES, this.surfaceIndexSize, this.GL.UNSIGNED_SHORT, 0);
@@ -179,7 +415,15 @@ class RoadSurfaceInspector {
 
 
     _drawBackgroundGL2() {
-        return;
+        this.GL.useProgram(this.backgroundProgram);
+        this.GL.disable(this.GL.DEPTH_TEST);
+
+        this.GL.enableVertexAttribArray(this.VX_BUF);
+        this.GL.bindBuffer(this.GL.ARRAY_BUFFER, this.backgroundVertexBuffer);
+        this.GL.vertexAttribPointer(this.VX_BUF, 3, this.GL.FLOAT, false, 0, 0);
+
+        this.GL.bindBuffer(this.GL.ELEMENT_ARRAY_BUFFER, this.backgroundIndexBuffer);
+        this.GL.drawElements(this.GL.TRIANGLES, this.backgroundIndexSize, this.GL.UNSIGNED_SHORT, 0);
     }
 
 
@@ -207,24 +451,55 @@ class RoadSurfaceInspector {
         if (!this.drag) {
             return false;
         }
+
         this.mouseDX = (e.pageX - this.mouseOldX) * 2*Math.PI / this.canvas.width,
-        this.mouseDY = (e.pageY - this.mouseOldX) * 2*Math.PI / this.canvas.height;
-        this.theta += this.mouseDX;
-        this.phi += this.mouseDY;
+        this.mouseDY = (e.pageY - this.mouseOldY) * 2*Math.PI / this.canvas.height;
+
+        let newPhi = this.phi + this.orbitSensitivity * this.mouseDY;
+        if (Math.abs(newPhi) < Math.PI / 3) {
+            this.phi = newPhi;
+        }
+        this.theta += this.orbitSensitivity * this.mouseDX;
         this.mouseOldX = e.pageX;
         this.mouseOldY = e.pageY;
+
+        this._updateCam();
+        
         e.preventDefault();
         return true;
     }
 
 
-    _createProjectionMatrix(fovY, aspectRatio, zNear, zFar) {
-        let tanFovY = Math.tan(fovY / 2);
-        return new Float32Array([1 / (aspectRatio * tanFovY), 0, 0, 0,
-                                 0, 1 / (tanFovY), 0, 0,
-                                 0, 0, zFar / (zFar - zNear), -1,
-                                 0, 0, -(zFar * zNear) / (zFar - zNear), 0]);
+    _mouseWheel(e) {
+        var delta = e.wheelDelta ? -e.wheelDelta : e.detail;
+        delta = this.orbitSensitivity * delta / 100;
+        let newOrbit = this.camOrbitRadius + delta;
+        if (newOrbit > 1.0 && newOrbit < 30.0) {
+            this.camOrbitRadius = newOrbit;
+            this._updateCam();
+        }
     }
+
+
+    _updateCam() {
+        this.camPos[0] = this.camOrbitRadius * Math.cos(this.phi) * Math.sin(this.theta);
+        this.camPos[1] = this.camOrbitRadius * Math.sin(this.phi) * Math.sin(this.theta);
+        this.camPos[2] = this.camOrbitRadius * Math.cos(this.theta);
+
+        let viewDir = this._vecSub(this.camPOI, this.camPos);
+        this.GL.useProgram(this.surfaceProgram);
+
+        this.viewMat = this._lookAt(this.camPos, this.camPOI, this.camUp);
+        let viewLoc = this.GL.getUniformLocation(this.surfaceProgram, 'view');
+        this.GL.uniformMatrix4fv(viewLoc, false, this.viewMat);
+        let viewDirLoc = this.GL.getUniformLocation(this.surfaceProgram, 'viewDir');
+        this.GL.uniform3fv(viewDirLoc, new Float32Array(viewDir));
+
+        this.GL.useProgram(this.backgroundProgram);
+        let skyViewMat = this._lookAt([0,0,0], viewDir, this.camUp);
+        let skyViewLoc = this.GL.getUniformLocation(this.backgroundProgram, 'view');
+        this.GL.uniformMatrix4fv(skyViewLoc, false, skyViewMat);
+}
 
 
     _createShaderProgram(vertexSource, fragmentSource) {
@@ -275,23 +550,61 @@ class RoadSurfaceInspector {
             surfaceVertexSource = `#version 300 es
                                 precision highp float;
                                 layout(location = 0) in vec3 vertexPos;
+                                layout(location = 1) in vec3 vertexNormal;
+
+                                out vec3 position;
+                                out vec3 normal;
 
                                 uniform mat4 model;
                                 uniform mat4 view;
                                 uniform mat4 projection;
 
                                 void main(void) {
-                                    gl_Position = vec4(vertexPos, 1.0);//projection * view * model * vec4(vertexPos, 1.0);
+                                    position = vertexPos;
+                                    normal = normalize(vertexNormal); // TODO : Model Rotation
+                                    gl_Position =  projection * view * model * vec4(vertexPos, 1.0);
                                 }`;
-
 
             surfaceFragSource = `#version 300 es
                                 precision highp float;
 
+                                in vec3 position;
+                                in vec3 normal;
+
                                 out vec4 fragmentColor;
 
+                                uniform vec3 viewDir;
+
                                 void main(void) {
-                                    fragmentColor = vec4(1, 0, 0, 1);
+                                    const float shininess = 20.0;
+                                    const vec3 lightPos = vec3(5.0, 20.0, 5.0);
+                                    vec3 lightDir = normalize(lightPos - position);
+
+                                    float height_color = pow(3.0*abs(position.y), 2.0);
+                                    vec3 color = vec3(0.9);
+                                    if (position.y >= 0.0) {
+                                        color = color + vec3(-0.5*height_color, -0.2*height_color, height_color);
+                                    } else {
+                                        color = color + vec3(height_color, -0.35*height_color, -0.5*height_color);
+                                    }
+
+                                    vec3 ambient = 0.05 * color;
+
+                                    float lambertian = max(dot(lightDir, normal), 0.0);
+                                    float s = 0.0;                                    
+
+                                    vec3 diffuse = lambertian * color;
+                                    
+                                    if (lambertian > 0.0) {
+                                        //vec3 viewDir = normalize(-position);
+                                        vec3 halfDir = normalize(lightDir - normalize(viewDir));
+                                        float specAngle = 0.999*max(dot(halfDir, normal), 0.0);
+                                        s = 0.01*pow(specAngle, shininess/1.0);
+                                    }
+                                    vec3 specular = s * color;
+
+                                    fragmentColor = vec4(ambient + diffuse + specular, 1);
+                                    //fragmentColor = vec4(1.0*specular, 1);
                                 }`;
 
 
@@ -299,31 +612,32 @@ class RoadSurfaceInspector {
                                 precision highp float;
                                 layout(location = 0) in vec3 vertexPos;
 
-                                out vec3 backgroundPos;
+                                out vec3 skyPos;
 
-                                uniform mat4 model;
                                 uniform mat4 view;
                                 uniform mat4 projection;
 
                                 void main(void) {
-                                    backgroundPos = vec3(model * vec4(vertexPos, 1));
-                                    gl_Position = projection * view * model * vec4(vertexPos, 1.0);
+                                    skyPos = vec3(vertexPos);
+                                    
+                                    gl_Position =  projection * view * vec4(vertexPos, 1.0);
+                                    
                                 }`;
 
             backgroundFragSource = `#version 300 es
                                 precision highp float;
 
-                                in vec3 backgroundPos;
+                                in vec3 skyPos;
                                 out vec4 fragmentColor;
 
-                                uniform vec4 backgroundColorTop;
-                                uniform vec4 backgroundColorBottom;
+                                uniform vec4 colorTop;
+                                uniform vec4 colorBottom;
 
                                 void main(void) {
-                                    vec3 unitBackgroundPos = normalize(backgroundPos);
-                                    float interp = pow(0.5 * abs(unitBackgroundPos.y + 1.0), 0.6);
+                                    vec3 unitPos = normalize(skyPos);
 
-                                    fragmentColor = mix(backgroundColorTop, backgroundColorBottom, interp);
+                                    float height = pow(1.0 * abs(unitPos.y + 0.08), 0.7);
+                                    fragmentColor = mix(colorBottom, colorTop, height);
                                 }`;
 
 
@@ -332,36 +646,43 @@ class RoadSurfaceInspector {
                                 precision highp float;
 
                                 attribute vec3 vertexPos;
-                                varying vec4 color;
+
+                                uniform mat4 model;
+                                uniform mat4 view;
                                 uniform mat4 projection;
 
                                 void main(void) {
-                                    gl_Position = vec4(projection * translate *  rotate *  scale * vertexPos, 1.0);
+                                    gl_Position = projection * view * model * vec4(vertexPos, 1.0);
                                 }`;
+
             surfaceFragSource = `#version 100
                           precision highp float;
                           varying vec4 color;
 
                           void main(void) {
-                            gl_FragColor = color;
+                            gl_FragColor = vec4(1, 1, 0, 1);
                           }`;
+
+
 
             surfaceVertexSource = `#version 100
                                 precision highp float;
 
                                 attribute vec3 vertexPos;
-                                varying vec4 color;
+
+                                uniform mat4 model;
+                                uniform mat4 view;
                                 uniform mat4 projection;
 
                                 void main(void) {
-                                    gl_Position = vec4(projection * translate *  rotate *  scale * vertexPos, 1.0);
+                                    gl_Position = projection * view * model * vec4(vertexPos, 1.0);
                                 }`;
+
             surfaceFragSource = `#version 100
                           precision highp float;
-                          varying vec4 color;
 
                           void main(void) {
-                            gl_FragColor = color;
+                            gl_FragColor = vec4(1, 1, 0, 1);
                           }`;
         }
 
@@ -370,4 +691,108 @@ class RoadSurfaceInspector {
         this.backgroundProgram = this._createShaderProgram(backgroundVertexSource, backgroundFragSource, 'background');
         return (this.surfaceProgram != false && this.backgroundProgram != false);
     }
+
+
+    /* 
+     * -------------- Naive Math Utilities Inc. ----------------
+     * vec3 and mat4 utils.
+     * Note that all matrices are defined in column-major order!
+     * ---------------------------------------------------------
+     */
+
+
+     _dot(u, v) {
+        return u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+     }
+
+
+     _cross(u, v) {
+        return [
+            u[1]*v[2] - u[2]*v[1],
+            u[2]*v[0] - u[0]*v[2],
+            u[0]*v[1] - u[1]*v[0]];
+     }
+
+
+     _vecNorm(u) {
+        return Math.sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+     }
+
+
+     _vecAdd(u, v) {
+        return [u[0]+v[0], u[1]+v[1], u[2]+v[2]];
+     }
+
+
+     _vecSub(u, v) {
+        return [u[0]-v[0], u[1]-v[1], u[2]-v[2]];
+     }
+
+
+     _vecScale(u, a) {
+        return [a*u[0], a*u[1], a*u[2]];
+     }
+
+
+     _normalize(u) {
+        let norm = this._vecNorm(u);
+        if (norm < 0.00001) return [0, 0, 0];
+        return this._vecScale(u, 1/norm);
+     }
+
+
+    _translate(t) {
+        return new Float32Array([
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            t[0], t[1], t[2], 1]);
+    }
+
+
+    _scale(s) {
+        return new Float32Array([
+            s[0], 0, 0, 0,
+            0, s[1], 0, 0,
+            0, 0, s[2], 0,
+            0, 0, 0, 1]);
+    }
+
+
+    _rotate(a, v, m2) {
+        // TODO
+    }
+
+
+    _projection(yFov, aspectRatio, near, far) {
+        let tanFovY = Math.tan(yFov / 2);
+        return new Float32Array([1 / (aspectRatio * tanFovY), 0, 0, 0,
+                                 0, 1 / tanFovY, 0, 0,
+                                 0, 0, -(far + near) / (far - near), -(2 * far * near) / (far - near),
+                                 0, 0, -1, 0]); 
+    }
+
+
+    _lookAt(pos, target, up) {
+        let z = this._normalize(this._vecSub(pos, target));
+        let x = this._normalize(this._cross(up, z));
+        let y = this._normalize(this._cross(z, x));
+
+        return new Float32Array([
+            x[0], y[0], z[0], 0,
+            x[1], y[1], z[1], 0,
+            x[2], y[2], z[2], 0,
+            -this._dot(x, pos), -this._dot(y, pos), -this._dot(z, pos), 1
+            ]);
+    }
+
+
+    _eye4() {
+        return new Float32Array([
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1]);
+    }
+
 }
