@@ -10,14 +10,13 @@ class RoadSurfaceInspector {
         this.leftTrack = leftTrack;
         this.rightTrack = rightTrack;
         this.renderCallback = renderCallback;
-        this.sampleDistance = params.sampleDistance == null ? 0.5 : params.sampleDistance;
+        this.Ds = params.Ds == null ? 0.5 : params.Ds;
         this.trackWidth = params.trackWidth == null ? 1.55 : params.trackWidth;
         this.laneWidth = params.laneWidth == null ? 3.5 : params.laneWidth;
-        this.widthSubdivisions = params.widthSubdivisions == null ? 1 : params.widthSubdivisions;
-        this.lengthSubdivisions = params.lengthSubdivisions == null ? 1 : params.lengthSubdivisions;
+        this.lengthSubdivisions = params.lengthSubdivisions == null ? 8: params.lengthSubdivisions;
         this.roadBankingAngle = params.roadBankingAngle == null ? 0 : params.roadBankingAngle;
         this.roadGradeAngle = params.roadGradeAngle == null ? 0 : params.roadGradeAngle;
-        this.roadRoughness = params.roadRoughness == null ? 0.015 : params.roadRoughness;
+        this.roadRoughness = params.roadRoughness == null ? 0.01 : params.roadRoughness;
         this.backgroundColorTop = params.backgroundColorTop == null ? {r: 0.3, g: 0.5, b: 0.9, a: 1} : params.backgroundColorTop;
         this.backgroundColorBottom = params.backgroundColorBottom == null ? {r: 0.44, g: 0.64, b: 0.95, a: 1} : params.backgroundColorBottom;
         this.forceGL1 = params.forceGL1 == null ? false : params.forceGL1;
@@ -33,9 +32,11 @@ class RoadSurfaceInspector {
             this.error = "Lane width must be larger than track width!";
             return;
         }
-        this.roadLength = this.sampleDistance * this.leftTrack.length;
-        this.DsX = this.sampleDistance / (this.lengthSubdivisions + 1);
-        this.DsY = this.trackWidth / (this.widthSubdivisions + 1);
+        this.roadLength = this.Ds * this.leftTrack.length;
+
+        this.trackWidth = this.Ds * Math.round(this.trackWidth / this.Ds);
+        this.laneWidth = this.trackWidth + 2*this.Ds * Math.round((this.laneWidth - this.trackWidth) / (2*this.Ds));
+        this.DsOut = this.Ds / this.lengthSubdivisions;
 
         this.drag = false;
         this.mouseDX = 0;
@@ -51,7 +52,8 @@ class RoadSurfaceInspector {
         this.camPOI = [0, 0, 0];
         this.camQuaternion = []
 
-        this.surfaceGrid = null;
+        this.sourceGrid = null;
+        this.biCubicGrid = null;
         this.surfaceVertices = null;
         this.surfaceIndices = null;
         this.surfaceNormals = null;
@@ -241,65 +243,147 @@ class RoadSurfaceInspector {
 
 
     _generateSurfaceGrid() {
-        const L = this.roadLength;
+        //const L = this.roadLength;
         const TW = this.trackWidth;
         const LW = this.laneWidth;
-        const OW = (LW - TW) / 2; 
+        //const OW = (LW - TW) / 2; 
         const LSD = this.lengthSubdivisions;
-        const inN = this.leftTrack.length
-        const N = inN * (LSD + 1) - 1;
-        const outerNum = Math.max(1, Math.round(OW / this.DsY));
-        const innerNum = 2 + this.widthSubdivisions;
-        const M = 2 * outerNum + innerNum;
 
-        // Initialize height grid:
-        this.surfaceGrid = new Array(N+1);
-        for (let i=0; i<N+1; i++) {
-            this.surfaceGrid[i] = new Array(M);
+        const inN = this.leftTrack.length;
+        const inM = 2 + Math.round((LW - TW) / this.Ds);
+
+        const N = (inN - 1) * LSD + 1;
+        const outerM = (inM-2) * LSD;
+        const inInnerM = TW / this.Ds + 1;
+        const innerM = (inInnerM - 1) * LSD + 1;
+        const M = outerM + innerM;
+
+        const lTrackIn = (inM-2) / 2 + 1;
+        const rTrackIn = lTrackIn + 1;
+        const lTrack = outerM / 2+1;
+        const rTrack = M - outerM / 2;
+
+        const smallStep = 2;
+        const largeStep = inInnerM+1;
+
+        /*
+        console.log("inN: " + inN);
+        console.log("inM: " + inM);
+        console.log("lTrackIn: " + lTrackIn);
+        console.log("rTrackIn: " + rTrackIn);
+        console.log("N: " + N);
+        console.log("M: " + M);
+        console.log("outerM: " + outerM);
+        console.log("innerM: " + innerM);       
+        console.log("inInnerM: " + inInnerM); 
+        console.log("lTrack: " + lTrack);
+        console.log("rTrack: " + rTrack);*/
+
+        // Initialize height grid with zeros:
+        this.sourceGrid = new Array(inN+3);
+        for (let i=0; i<inN+3; i++) {
+            this.sourceGrid[i] = new Float32Array(inM+3);
         }
 
-        // Set road height grid outside track:
-        for (let i=0; i<N+1; i++) {
-            for(let j=0; j < outerNum; j++) {
-                this.surfaceGrid[i][j] = 0;
-                this.surfaceGrid[i][M-1-j] = 0;
-            }
-        }
-
-        let inGrid = [this.leftTrack, this.rightTrack];
-        // Boundary condition:
-        inGrid[0].push(0); 
-        inGrid[1].push(0);
-
-        // Set road height grid inside track:
+        // Insert input track values in height grid:
         for (let i=0; i<inN; i++) {
-            for(let j=0; j < innerNum; j++) {
-                if (j == 0 || j == innerNum-1) { // On a track
-                    let inIndex = j == 0 ? j : 1;
-                    this.surfaceGrid[i * (1+LSD)][outerNum + j] = inGrid[inIndex][i];
+            this.sourceGrid[i+1][lTrackIn] = this.leftTrack[i];
+            this.sourceGrid[i+1][lTrackIn-1] = this.leftTrack[i];
+            this.sourceGrid[i+1][rTrackIn] = this.rightTrack[i];
+            this.sourceGrid[i+1][rTrackIn+1] = this.rightTrack[i];
+        }
+        //console.log(this.sourceGrid);
 
-                    for (let k=1; k<LSD+1; k++) { // Interpolate lengthwise
-                        this.surfaceGrid[i * (1+LSD) + k][outerNum + j] = 0.5 * (inGrid[inIndex][i] + inGrid[inIndex][i+1]);
-                    }
-                } else { // In-between tracks - interpolate!
-                    let interp = (inGrid[0][i] + inGrid[1][i]) / 2;
-                    this.surfaceGrid[i * (1+LSD)][outerNum + j] = interp; //Math.sign(interp) * Math.pow(interp, 2);
+        // Initialize output height grid:
+        this.biCubicGrid = new Array(N+3);
+        for (let i=0; i<N+3; i++) {
+            this.biCubicGrid[i] = new Float32Array(M+3);
+        }
 
-                    for (let k=1; k<LSD+1; k++) { // Interpolate lengthwise
-                        let interp1 = (inGrid[0][i] + inGrid[1][i]) / 2;
-                        let interp2 = (inGrid[0][i+1] + inGrid[1][i+1]) / 2;
-                        this.surfaceGrid[i*(1+LSD) + k][outerNum + j] = 0.5 * (interp1 + interp2);
-                    }
+        //console.log(this.biCubicGrid);
+        let subI = 0;
+        let subJ = 0;
+        let interpX = 0;
+        let interpY = 0;
+        let sourceI = 0;
+        let sourceJ = 0;
+        let curStep1 = smallStep;
+        let curStep2 = smallStep;
+
+        for (let i=1; i<N+1; i++) {
+            subI = ((i-1) % LSD);
+            sourceI = 1+((i-1) - subI) / LSD;
+            interpX = subI / LSD;
+            //console.log(sourceI);
+            for (let j=1; j<M+1; j++) {
+                if (j == lTrack) {
+                    curStep1 = smallStep;
+                    curStep2 = largeStep;
+                } else if (j == rTrack) {
+                    curStep1 = largeStep;
+                    curStep2 = smallStep;
+                } else {
+                    curStep1 = smallStep;
+                    curStep2 = smallStep;
                 }
+
+                if (j >= lTrack && j < rTrack) {
+                    curStep1 = largeStep;
+                    curStep2 = largeStep;
+                    sourceJ = lTrackIn;
+                    interpY = (j - rTrack + innerM) / (innerM);
+                } else if (j >= rTrack) {
+                    subJ = ((j-1) % LSD);
+                    sourceJ = 1+((j-1) - subJ) / LSD - (inInnerM - 2);
+                    interpY = subJ / LSD;
+                } else {
+                    subJ = ((j-1) % LSD);
+                    sourceJ = 1+((j-1) - subJ) / LSD;
+                    interpY = subJ / LSD;
+                }                
+                //console.log(interpY);
+                //console.log(sourceI);
+
+                this.biCubicGrid[i][j] = this._interpBiCubic(interpX, interpY, sourceI, sourceJ, smallStep, curStep1, curStep2);
             }
         }
+        //console.log(this.biCubicGrid);
+    }
+
+
+    _interpBiCubic(x, y, i, j, longStep, latStep1, latStep2) {
+        //console.log(this.sourceGrid);
+        return this._interpCubic(y,
+            this._interpCubic(x, this.sourceGrid[i-1][j-1], this.sourceGrid[i][j-1], this.sourceGrid[i+1][j-1], this.sourceGrid[i+2][j-1], longStep, longStep),
+            this._interpCubic(x, this.sourceGrid[i-1][j  ], this.sourceGrid[i][j  ], this.sourceGrid[i+1][j  ], this.sourceGrid[i+2][j  ], longStep, longStep),
+            this._interpCubic(x, this.sourceGrid[i-1][j+1], this.sourceGrid[i][j+1], this.sourceGrid[i+1][j+1], this.sourceGrid[i+2][j+1], longStep, longStep),
+            this._interpCubic(x, this.sourceGrid[i-1][j+2], this.sourceGrid[i][j+2], this.sourceGrid[i+1][j+2], this.sourceGrid[i+2][j+2], longStep, longStep),
+            latStep1, latStep2);
+    }
+
+
+    _interpCubic(x, p0, p1, p2, p3, step1, step2) {
+        // f (x) = ax^3 + bx^2 + cx + d
+        // f'(x) = 3ax^2 + 2bx + c
+        let f0 = p1;
+        let f1 = p2;
+        // Different step length for numerical derivatives:
+        let df0 = (p2 - p0) / step1; 
+        let df1 = (p3 - p1) / step2;
+        let a = 2.0*f0 - 2.0*f1 + df0 + df1;
+        let b = -3.0*f0 + 3.0*f1 - 2.0*df0 - df1;
+        let c = df0;
+        let d = f0;
+        return a * Math.pow(x, 3) + b * Math.pow(x, 2) + c * x + d;
+        //return (c - a + (2.0*a - 5.0*b + 4.0*c - d + (3.0*(b - c) + d - a)*interp)*interp)*interp/step + b;
     }
 
 
     _generateSurfaceTriangles() {
-        const N = this.surfaceGrid.length; 
-        const M = this.surfaceGrid[0].length;
+        const N = this.biCubicGrid.length; 
+        const M = this.biCubicGrid[0].length;
         const numTriangles = (N-1) * (M-1) * 2;
+        const LSD = this.lengthSubdivisions
 
         this.surfaceVertices = new Float32Array(N * M * 3);
         this.surfaceIndices = new Uint16Array(numTriangles * 3);
@@ -307,9 +391,9 @@ class RoadSurfaceInspector {
 
         for (let x=0; x<N; x++) {
             for(let z=0; z<M; z++) {
-                this.surfaceVertices[(x + z * N)*3 + 0] = x * this.DsX;
-                this.surfaceVertices[(x + z * N)*3 + 1] = this.surfaceGrid[x][z] + this.roadRoughness * (Math.random() * 2 - 1);
-                this.surfaceVertices[(x + z * N)*3 + 2] = z * this.DsY;
+                this.surfaceVertices[(x + z * N)*3 + 0] = x * this.DsOut;
+                this.surfaceVertices[(x + z * N)*3 + 1] = this.biCubicGrid[x][z] + this.roadRoughness * (Math.random() * 2 - 1) / LSD;
+                this.surfaceVertices[(x + z * N)*3 + 2] = z * this.DsOut;
             }
         }
 
@@ -332,7 +416,6 @@ class RoadSurfaceInspector {
                     this._vecSub(b, c),
                     this._vecSub(d, c));
 
-                //console.log(normal1);
                 this.surfaceNormals[ax+0] = normal1[0];
                 this.surfaceNormals[ax+1] = normal1[1];
                 this.surfaceNormals[ax+2] = normal1[2];
@@ -443,7 +526,6 @@ class RoadSurfaceInspector {
 
     _mouseUp(e) {
         this.drag = false;
-        console.log("Release");
     }
 
 
@@ -570,25 +652,26 @@ class RoadSurfaceInspector {
 
                                 in vec3 position;
                                 in vec3 normal;
+                                in vec3 vBC;
 
                                 out vec4 fragmentColor;
 
                                 uniform vec3 viewDir;
 
                                 void main(void) {
-                                    const float shininess = 20.0;
-                                    const vec3 lightPos = vec3(5.0, 20.0, 5.0);
+                                    const float shininess = 50.0;
+                                    const vec3 lightPos = vec3(10.0, 10.0, 15.0);
                                     vec3 lightDir = normalize(lightPos - position);
 
-                                    float height_color = pow(3.0*abs(position.y), 2.0);
+                                    float height_color = pow(3.0*abs(position.y), 1.8);
                                     vec3 color = vec3(0.9);
                                     if (position.y >= 0.0) {
-                                        color = color + vec3(-0.5*height_color, -0.2*height_color, height_color);
+                                        color = color + vec3(-0.5*height_color, 0.5*height_color, height_color) * color;
                                     } else {
-                                        color = color + vec3(height_color, -0.35*height_color, -0.5*height_color);
+                                        color = color + vec3(height_color, -0.35*height_color, -0.5*height_color) * color;
                                     }
 
-                                    vec3 ambient = 0.05 * color;
+                                    vec3 ambient = 0.1 * color;
 
                                     float lambertian = max(dot(lightDir, normal), 0.0);
                                     float s = 0.0;                                    
@@ -598,13 +681,12 @@ class RoadSurfaceInspector {
                                     if (lambertian > 0.0) {
                                         //vec3 viewDir = normalize(-position);
                                         vec3 halfDir = normalize(lightDir - normalize(viewDir));
-                                        float specAngle = 0.999*max(dot(halfDir, normal), 0.0);
-                                        s = 0.01*pow(specAngle, shininess/1.0);
+                                        float specAngle = max(dot(halfDir, normal), 0.0);
+                                        s = 0.2*pow(specAngle, shininess);
                                     }
                                     vec3 specular = s * color;
 
                                     fragmentColor = vec4(ambient + diffuse + specular, 1);
-                                    //fragmentColor = vec4(1.0*specular, 1);
                                 }`;
 
 
